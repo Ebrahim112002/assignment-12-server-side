@@ -13,14 +13,11 @@ app.use(express.json());
 
 // Placeholder authentication middleware (replace with your actual auth logic)
 const authenticate = (req, res, next) => {
-  // Example: Firebase/JWT token verification
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) {
     return res.status(401).json({ error: 'Unauthorized: No token provided' });
   }
-  // Replace with actual token verification (e.g., Firebase Admin SDK or JWT)
-  // Example: const decodedToken = jwt.verify(token, process.env.JWT_SECRET);
-  // req.user = decodedToken;
+  // Example: verify token here (Firebase/JWT)
   next();
 };
 
@@ -40,6 +37,8 @@ async function run() {
     const db = client.db('matrimonial');
     const usersCollection = db.collection('users');
     const membersCollection = db.collection('members');
+    const success_counters = db.collection('success_counter');
+    const favouritesCollection = db.collection('favourites');
 
     // Create or update user
     app.post('/users', async (req, res) => {
@@ -48,7 +47,13 @@ async function run() {
         if (!email || !uid) {
           return res.status(400).json({ error: 'Email and UID are required' });
         }
-        const user = { name: name || 'Unnamed User', email, photoURL: photoURL || '', role: role || 'user', uid };
+        const user = {
+          name: name || 'Unnamed User',
+          email,
+          photoURL: photoURL || '',
+          role: role || 'user',
+          uid,
+        };
         const result = await usersCollection.updateOne(
           { email },
           { $set: user },
@@ -76,6 +81,17 @@ async function run() {
       }
     });
 
+    // Success counter
+    app.get('/success-counter', async (req, res) => {
+      try {
+        const success = await success_counters.find().toArray();
+        res.json(success);
+      } catch (error) {
+        console.error('Error fetching success counters:', error);
+        res.status(500).json({ error: 'Failed to fetch success counters' });
+      }
+    });
+
     // Get all members
     app.get('/biodatas', async (req, res) => {
       try {
@@ -87,43 +103,57 @@ async function run() {
       }
     });
 
-    // Get single member by ID
-    app.get('/biodatas/:id',  async (req, res) => {
+    // Get single member by ID (handles both ObjectId and string _id)
+    app.get('/biodatas/:id', async (req, res) => {
       try {
         const id = req.params.id;
-        // Validate ObjectId
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).json({ error: 'Invalid Biodata ID' });
+        console.log("Requested ID:", id);
+
+        let member = null;
+
+        if (ObjectId.isValid(id)) {
+          member = await membersCollection.findOne({ _id: new ObjectId(id) });
         }
-        const member = await membersCollection.findOne({ _id: new ObjectId(id) });
+
+        // fallback in case _id was stored as string
         if (!member) {
-          return res.status(404).json({ error: 'Member not found' });
+          member = await membersCollection.findOne({ _id: id });
         }
+
+        if (!member) {
+          return res.status(404).json({ error: `No member found with ID: ${id}` });
+        }
+
         res.json(member);
       } catch (error) {
-        console.error('Error fetching member:', error);
-        res.status(500).json({ error: 'Failed to fetch member' });
+        console.error(`Error fetching member with ID ${req.params.id}:`, error);
+        res.status(500).json({ error: 'Failed to fetch member', details: error.message });
       }
     });
-    // favorite
-    app.post('/favourites', authenticate, async (req, res) => {
-  try {
-    const { userEmail, biodataId } = req.body;
-    if (!userEmail || !biodataId) {
-      return res.status(400).json({ error: 'User email and biodata ID are required' });
-    }
-    if (!ObjectId.isValid(biodataId)) {
-      return res.status(400).json({ error: 'Invalid Biodata ID' });
-    }
-    const favourite = { userEmail, biodataId: new ObjectId(biodataId), addedAt: new Date() };
-    const result = await db.collection('favourites').insertOne(favourite);
-    res.status(201).json({ message: 'Biodata added to favourites', result });
-  } catch (error) {
-    console.error('Error adding to favourites:', error);
-    res.status(500).json({ error: 'Failed to add to favourites' });
-  }
-});
 
+    // Add to favourites
+    app.post('/favourites', authenticate, async (req, res) => {
+      try {
+        const { userEmail, biodataId } = req.body;
+        if (!userEmail || !biodataId) {
+          return res.status(400).json({ error: 'User email and biodata ID are required' });
+        }
+
+        const favourite = {
+          userEmail,
+          biodataId: ObjectId.isValid(biodataId) ? new ObjectId(biodataId) : biodataId,
+          addedAt: new Date(),
+        };
+
+        const result = await favouritesCollection.insertOne(favourite);
+        res.status(201).json({ message: 'Biodata added to favourites', result });
+      } catch (error) {
+        console.error('Error adding to favourites:', error);
+        res.status(500).json({ error: 'Failed to add to favourites' });
+      }
+    });
+
+    // MongoDB ping
     await client.db('admin').command({ ping: 1 });
     console.log('Connected to MongoDB successfully');
   } catch (error) {
