@@ -225,43 +225,39 @@ async function run() {
       }
     });
 
-    // Update user role
-    app.patch('/users/:email/role', authenticate, authorizeAdmin, async (req, res) => {
-      try {
-        const email = req.params.email;
-        const { role } = req.body;
+// Make sure you have auth middleware that sets req.user
+// This version allows updating other users but prevents self-role change
 
-        if (!email) {
-          return res.status(400).json({ error: 'Email is required' });
-        }
-        if (!['admin', 'user'].includes(role)) {
-          return res.status(400).json({ error: 'Role must be either "admin" or "user"' });
-        }
+app.patch('/users/:email/role', async (req, res) => {
+  try {
+    const emailToUpdate = req.params.email.toLowerCase();
+    const { role } = req.body;
 
-        const user = await usersCollection.findOne({ email });
-        if (!user) {
-          return res.status(404).json({ error: 'User not found' });
-        }
+    if (!emailToUpdate) return res.status(400).json({ error: 'Email is required' });
+    if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Role must be "admin" or "user"' });
 
-        if (user.email === req.user.email) {
-          return res.status(403).json({ error: 'Cannot change your own role' });
-        }
+    const userToUpdate = await usersCollection.findOne({ email: emailToUpdate });
+    if (!userToUpdate) return res.status(404).json({ error: 'User not found' });
 
-        const result = await usersCollection.updateOne(
-          { email },
-          { $set: { role, updatedAt: new Date() } }
-        );
+    // Prevent updating your own role
+    if (req.user && req.user.email.toLowerCase() === emailToUpdate) {
+      return res.status(403).json({ error: 'Cannot change your own role' });
+    }
 
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ error: 'User not found' });
-        }
+    const result = await usersCollection.updateOne(
+      { email: emailToUpdate },
+      { $set: { role, updatedAt: new Date() } }
+    );
 
-        res.json({ message: `User role updated to ${role} successfully`, result });
-      } catch (error) {
-        console.error('Error updating user role:', error.message);
-        res.status(500).json({ error: 'Failed to update user role', details: error.message });
-      }
-    });
+    res.json({ message: `User role updated to ${role} successfully`, updatedRole: role });
+  } catch (err) {
+    console.error('Error updating user role:', err.message);
+    res.status(500).json({ error: 'Failed to update user role', details: err.message });
+  }
+});
+
+
+
 
     // Success counter
     app.get('/success-counter', async (req, res) => {
