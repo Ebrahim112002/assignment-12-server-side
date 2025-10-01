@@ -168,7 +168,7 @@ async function run() {
       }
     }
 
-    // Create or update user
+    // Create user (only if not exists)
     app.post('/users', authenticate, async (req, res) => {
       try {
         const { name, photoURL, role } = req.body;
@@ -176,28 +176,29 @@ async function run() {
         if (!email || !uid) {
           return res.status(400).json({ error: 'Email and UID are required' });
         }
+        const existingUser = await usersCollection.findOne({ email });
+        if (existingUser) {
+          return res.status(409).json({ error: 'User already exists' });
+        }
         const user = {
           name: name || 'Unnamed User',
           email,
           photoURL: photoURL || '',
           role: role || 'user',
           uid,
+          createdAt: new Date(),
           updatedAt: new Date(),
         };
-        const result = await usersCollection.updateOne(
-          { email },
-          { $set: user },
-          { upsert: true }
-        );
-        res.status(201).json({ message: 'User created/updated successfully', result });
+        const result = await usersCollection.insertOne(user);
+        res.status(201).json({ message: 'User created successfully', result });
       } catch (error) {
-        console.error('Error creating/updating user:', error.message);
-        res.status(500).json({ error: 'Failed to create/update user', details: error.message });
+        console.error('Error creating user:', error.message);
+        res.status(500).json({ error: 'Failed to create user', details: error.message });
       }
     });
 
-    // Get all users
-    app.get('/users', async (req, res) => {
+    // Get all users (admin only)
+    app.get('/users', authenticate, authorizeAdmin, async (req, res) => {
       try {
         const users = await usersCollection.find().toArray();
         res.json(users);
@@ -207,57 +208,64 @@ async function run() {
       }
     });
 
-    // Get user by email
-    app.get('/users/:email', async (req, res) => {
+    // Get user by email (authenticated users can get their own or all if admin)
+    app.get('/users/:email', authenticate, async (req, res) => {
       try {
         const email = req.params.email;
         if (!email) {
           return res.status(400).json({ error: 'Email is required' });
         }
-        const user = await usersCollection.findOne({ email });
-        if (!user) {
+        // Allow fetching own user or all if admin
+        const userDoc = await usersCollection.findOne({ email });
+        if (!userDoc) {
           return res.status(404).json({ error: 'User not found' });
         }
-        res.json(user);
+        // If not admin and not own email, forbid
+        if (req.user.email !== email) {
+          const currentUser = await usersCollection.findOne({ email: req.user.email });
+          if (!currentUser || currentUser.role !== 'admin') {
+            return res.status(403).json({ error: 'Forbidden: Can only fetch own user data' });
+          }
+        }
+        res.json(userDoc);
       } catch (error) {
         console.error('Error fetching user:', error.message);
         res.status(500).json({ error: 'Failed to fetch user', details: error.message });
       }
     });
 
-// Make sure you have auth middleware that sets req.user
-// This version allows updating other users but prevents self-role change
+    // Update user role (admin only)
+    app.patch('/users/:email/role', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const emailToUpdate = req.params.email.toLowerCase();
+        const { role } = req.body;
 
-app.patch('/users/:email/role', async (req, res) => {
-  try {
-    const emailToUpdate = req.params.email.toLowerCase();
-    const { role } = req.body;
+        if (!emailToUpdate) return res.status(400).json({ error: 'Email is required' });
+        if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Role must be "admin" or "user"' });
 
-    if (!emailToUpdate) return res.status(400).json({ error: 'Email is required' });
-    if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Role must be "admin" or "user"' });
+        const userToUpdate = await usersCollection.findOne({ email: emailToUpdate });
+        if (!userToUpdate) return res.status(404).json({ error: 'User not found' });
 
-    const userToUpdate = await usersCollection.findOne({ email: emailToUpdate });
-    if (!userToUpdate) return res.status(404).json({ error: 'User not found' });
+        // Prevent updating your own role
+        if (req.user.email.toLowerCase() === emailToUpdate) {
+          return res.status(403).json({ error: 'Cannot change your own role' });
+        }
 
-    // Prevent updating your own role
-    if (req.user && req.user.email.toLowerCase() === emailToUpdate) {
-      return res.status(403).json({ error: 'Cannot change your own role' });
-    }
+        const result = await usersCollection.updateOne(
+          { email: emailToUpdate },
+          { $set: { role, updatedAt: new Date() } }
+        );
 
-    const result = await usersCollection.updateOne(
-      { email: emailToUpdate },
-      { $set: { role, updatedAt: new Date() } }
-    );
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'User not found' });
+        }
 
-    res.json({ message: `User role updated to ${role} successfully`, updatedRole: role });
-  } catch (err) {
-    console.error('Error updating user role:', err.message);
-    res.status(500).json({ error: 'Failed to update user role', details: err.message });
-  }
-});
-
-
-
+        res.status(200).json({ message: `User role updated to ${role} successfully`, updatedRole: role });
+      } catch (err) {
+        console.error('Error updating user role:', err.message);
+        res.status(500).json({ error: 'Failed to update user role', details: err.message });
+      }
+    });
 
     // Success counter
     app.get('/success-counter', async (req, res) => {
