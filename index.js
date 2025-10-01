@@ -269,6 +269,39 @@ async function run() {
       }
     });
 
+    // Update user premium status (admin only)
+    app.patch('/users/:email/premium', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const emailToUpdate = req.params.email.toLowerCase();
+        const { isPremium } = req.body;
+
+        if (!emailToUpdate) return res.status(400).json({ error: 'Email is required' });
+        if (typeof isPremium !== 'boolean') return res.status(400).json({ error: 'isPremium must be a boolean' });
+
+        const userToUpdate = await usersCollection.findOne({ email: emailToUpdate });
+        if (!userToUpdate) return res.status(404).json({ error: 'User not found' });
+
+        // Prevent updating your own premium status
+        if (req.user.email.toLowerCase() === emailToUpdate) {
+          return res.status(403).json({ error: 'Cannot change your own premium status' });
+        }
+
+        const result = await usersCollection.updateOne(
+          { email: emailToUpdate },
+          { $set: { isPremium, updatedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+
+        res.status(200).json({ message: `User premium status updated to ${isPremium ? 'premium' : 'normal'} successfully`, isPremium });
+      } catch (err) {
+        console.error('Error updating user premium status:', err.message);
+        res.status(500).json({ error: 'Failed to update user premium status', details: err.message });
+      }
+    });
+
     // Create contact request
     app.post('/contact-requests', authenticate, async (req, res) => {
       try {
@@ -450,9 +483,44 @@ async function run() {
         const email = req.query.email;
         let members;
         if (email) {
-          members = await membersCollection.find({ email }).toArray();
+          // For own biodata, join isPremium
+          members = await membersCollection.aggregate([
+            { $match: { email } },
+            {
+              $lookup: {
+                from: 'users',
+                localField: 'email',
+                foreignField: 'email',
+                as: 'user'
+              }
+            },
+            { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+            {
+              $addFields: {
+                isPremium: { $ifNull: ['$user.isPremium', false] }
+              }
+            },
+            { $project: { user: 0 } }
+          ]).toArray();
         } else {
-          members = await membersCollection.find().toArray();
+          // For all (public)
+          members = await membersCollection.aggregate([
+            {
+              $lookup: {
+                from: 'users',
+                localField: 'email',
+                foreignField: 'email',
+                as: 'user'
+              }
+            },
+            { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+            {
+              $addFields: {
+                isPremium: { $ifNull: ['$user.isPremium', false] }
+              }
+            },
+            { $project: { user: 0 } }
+          ]).toArray();
         }
         res.json(members);
       } catch (error) {
@@ -503,7 +571,6 @@ async function run() {
           maritalStatus: biodata.maritalStatus || '',
           profileImage: profileImageURL,
           email,
-          isPremium: false,
           createdAt: new Date(),
           updatedAt: new Date(),
         };
@@ -576,7 +643,6 @@ async function run() {
           maritalStatus: biodata.maritalStatus || existingBiodata.maritalStatus || '',
           profileImage: profileImageURL,
           email: existingBiodata.email,
-          isPremium: existingBiodata.isPremium || false,
           updatedAt: new Date(),
           createdAt: existingBiodata.createdAt || new Date(),
         };
@@ -598,6 +664,24 @@ async function run() {
           stack: error.stack,
         });
         res.status(500).json({ error: 'Failed to update biodata', details: error.message });
+      }
+    });
+
+    // Delete biodata by _id (admin only)
+    app.delete('/biodatas/:id', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: 'Invalid _id format' });
+        }
+        const result = await membersCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) {
+          return res.status(404).json({ error: 'Biodata not found' });
+        }
+        res.json({ message: 'Biodata deleted successfully' });
+      } catch (error) {
+        console.error('Error deleting biodata:', error.message);
+        res.status(500).json({ error: 'Failed to delete biodata', details: error.message });
       }
     });
 
