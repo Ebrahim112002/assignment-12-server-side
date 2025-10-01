@@ -96,6 +96,7 @@ async function run() {
     const membersCollection = db.collection('members');
     const success_counters = db.collection('success_counter');
     const favouritesCollection = db.collection('favourites');
+    const contactRequestsCollection = db.collection('contactRequests');
 
     // Configure axios-retry for ImgBB requests
     axiosRetry(axios, {
@@ -171,7 +172,7 @@ async function run() {
     // Create user (only if not exists)
     app.post('/users', authenticate, async (req, res) => {
       try {
-        const { name, photoURL, role } = req.body;
+        const { name, photoURL, role, isPremium = false } = req.body;
         const { email, uid } = req.user;
         if (!email || !uid) {
           return res.status(400).json({ error: 'Email and UID are required' });
@@ -185,6 +186,7 @@ async function run() {
           email,
           photoURL: photoURL || '',
           role: role || 'user',
+          isPremium,
           uid,
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -264,6 +266,138 @@ async function run() {
       } catch (err) {
         console.error('Error updating user role:', err.message);
         res.status(500).json({ error: 'Failed to update user role', details: err.message });
+      }
+    });
+
+    // Create contact request
+    app.post('/contact-requests', authenticate, async (req, res) => {
+      try {
+        const { biodataId } = req.body;
+        const { email } = req.user;
+
+        if (!biodataId) {
+          return res.status(400).json({ error: 'Biodata ID is required' });
+        }
+
+        // Check if user is premium
+        const userDoc = await usersCollection.findOne({ email });
+        if (!userDoc || !userDoc.isPremium) {
+          return res.status(403).json({ error: 'Only premium users can send contact requests. Please upgrade to premium.' });
+        }
+
+        // Check if request already exists
+        const existingRequest = await contactRequestsCollection.findOne({
+          requesterEmail: email,
+          requestedBiodataId: biodataId,
+        });
+
+        if (existingRequest) {
+          return res.status(400).json({ error: 'Contact request already sent for this biodata.' });
+        }
+
+        const request = {
+          requesterEmail: email,
+          requestedBiodataId: biodataId,
+          status: 'pending',
+          createdAt: new Date(),
+        };
+
+        const result = await contactRequestsCollection.insertOne(request);
+        res.status(201).json({
+          message: 'Contact request sent successfully. Waiting for admin approval.',
+          requestId: result.insertedId,
+        });
+      } catch (error) {
+        console.error('Error creating contact request:', error.message);
+        res.status(500).json({ error: 'Failed to send contact request', details: error.message });
+      }
+    });
+
+    // Get all contact requests (admin only)
+    app.get('/contact-requests', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        // Optionally filter by status, e.g., query param ?status=pending
+        const { status } = req.query;
+        const filter = status ? { status } : {};
+        const requests = await contactRequestsCollection.find(filter).toArray();
+
+        // Join with biodata and requester details
+        const requestsWithDetails = await Promise.all(
+          requests.map(async (req) => {
+            const biodata = await membersCollection.findOne({ _id: new ObjectId(req.requestedBiodataId) });
+            const requester = await usersCollection.findOne({ email: req.requesterEmail });
+            return { ...req, biodata, requester };
+          })
+        );
+
+        res.json(requestsWithDetails);
+      } catch (error) {
+        console.error('Error fetching contact requests:', error.message);
+        res.status(500).json({ error: 'Failed to fetch contact requests', details: error.message });
+      }
+    });
+
+    // Approve contact request (admin only)
+    app.patch('/contact-requests/:id/approve', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const requestId = req.params.id;
+        const result = await contactRequestsCollection.updateOne(
+          { _id: new ObjectId(requestId) },
+          { $set: { status: 'approved', approvedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Contact request not found' });
+        }
+
+        res.json({ message: 'Contact request approved successfully' });
+      } catch (error) {
+        console.error('Error approving contact request:', error.message);
+        res.status(500).json({ error: 'Failed to approve contact request', details: error.message });
+      }
+    });
+
+    // Reject contact request (admin only)
+    app.patch('/contact-requests/:id/reject', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const requestId = req.params.id;
+        const result = await contactRequestsCollection.updateOne(
+          { _id: new ObjectId(requestId) },
+          { $set: { status: 'rejected', rejectedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Contact request not found' });
+        }
+
+        res.json({ message: 'Contact request rejected successfully' });
+      } catch (error) {
+        console.error('Error rejecting contact request:', error.message);
+        res.status(500).json({ error: 'Failed to reject contact request', details: error.message });
+      }
+    });
+
+    // Get my contact requests
+    app.get('/my-contact-requests', authenticate, async (req, res) => {
+      try {
+        const { email } = req.user;
+        const requests = await contactRequestsCollection.find({ requesterEmail: email }).sort({ createdAt: -1 }).toArray();
+
+        // For approved requests, join with biodata details
+        const requestsWithDetails = await Promise.all(
+          requests.map(async (req) => {
+            if (req.status === 'approved') {
+              const biodata = await membersCollection.findOne({ _id: new ObjectId(req.requestedBiodataId) });
+              return { ...req, biodata };
+            }
+            return req;
+          })
+        );
+
+        res.json(requestsWithDetails);
+      } catch (error) {
+        console.error('Error fetching my contact requests:', error.message);
+        res.status(500).json({ error: 'Failed to fetch contact requests', details: error.message });
       }
     });
 
