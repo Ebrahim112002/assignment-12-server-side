@@ -1062,6 +1062,8 @@ async function run() {
       res.json({ message: "Favorite removed successfully" });
     });
 
+    
+
     await client.db('admin').command({ ping: 1 });
     console.log('MongoDB connected successfully');
   } catch (error) {
