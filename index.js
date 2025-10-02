@@ -56,7 +56,7 @@ const authenticate = async (req, res, next) => {
   }
   try {
     const decoded = await admin.auth().verifyIdToken(token);
-    req.user = { email: decoded.email, uid: decoded.uid };
+    req.user = { email: decoded.email.toLowerCase(), uid: decoded.uid };
     next();
   } catch (error) {
     console.error('Authentication error:', error.message);
@@ -67,7 +67,9 @@ const authenticate = async (req, res, next) => {
 // Admin authorization middleware
 const authorizeAdmin = async (req, res, next) => {
   try {
-    const user = await client.db('matrimonial').collection('users').findOne({ email: req.user.email });
+    const user = await client.db('matrimonial').collection('users').findOne({ 
+      email: { $regex: new RegExp(`^${req.user.email}$`, 'i') } 
+    });
     if (!user || user.role !== 'admin') {
       return res.status(403).json({ error: 'Forbidden: Admin access required' });
     }
@@ -172,18 +174,34 @@ async function run() {
     // Create user (only if not exists)
     app.post('/users', authenticate, async (req, res) => {
       try {
-        const { name, photoURL, role, isPremium = false } = req.body;
-        const { email, uid } = req.user;
-        if (!email || !uid) {
-          return res.status(400).json({ error: 'Email and UID are required' });
+        const { name, photoURL, role, isPremium = false, targetEmail } = req.body;
+        let email = targetEmail ? targetEmail.toLowerCase() : req.user.email;
+        let uid = req.user.uid;
+
+        if (targetEmail && targetEmail.toLowerCase() !== req.user.email.toLowerCase()) {
+          // Admin creating user for another email
+          const currentUser = await usersCollection.findOne({ 
+            email: { $regex: new RegExp(`^${req.user.email}$`, 'i') } 
+          });
+          if (!currentUser || currentUser.role !== 'admin') {
+            return res.status(403).json({ error: 'Admin required to create user for another email' });
+          }
+          // For other users, uid is null until they authenticate
+          uid = null;
         }
-        const existingUser = await usersCollection.findOne({ email });
+
+        if (!email) {
+          return res.status(400).json({ error: 'Email is required' });
+        }
+        const existingUser = await usersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${email.toLowerCase()}$`, 'i') } 
+        });
         if (existingUser) {
           return res.status(409).json({ error: 'User already exists' });
         }
         const user = {
           name: name || 'Unnamed User',
-          email,
+          email: email.toLowerCase(),
           photoURL: photoURL || '',
           role: role || 'user',
           isPremium,
@@ -213,18 +231,22 @@ async function run() {
     // Get user by email (authenticated users can get their own or all if admin)
     app.get('/users/:email', authenticate, async (req, res) => {
       try {
-        const email = req.params.email;
-        if (!email) {
+        const emailParam = req.params.email.toLowerCase();
+        if (!emailParam) {
           return res.status(400).json({ error: 'Email is required' });
         }
         // Allow fetching own user or all if admin
-        const userDoc = await usersCollection.findOne({ email });
+        const userDoc = await usersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${emailParam}$`, 'i') } 
+        });
         if (!userDoc) {
           return res.status(404).json({ error: 'User not found' });
         }
         // If not admin and not own email, forbid
-        if (req.user.email !== email) {
-          const currentUser = await usersCollection.findOne({ email: req.user.email });
+        if (req.user.email !== emailParam) {
+          const currentUser = await usersCollection.findOne({ 
+            email: { $regex: new RegExp(`^${req.user.email}$`, 'i') } 
+          });
           if (!currentUser || currentUser.role !== 'admin') {
             return res.status(403).json({ error: 'Forbidden: Can only fetch own user data' });
           }
@@ -245,16 +267,18 @@ async function run() {
         if (!emailToUpdate) return res.status(400).json({ error: 'Email is required' });
         if (!['admin', 'user'].includes(role)) return res.status(400).json({ error: 'Role must be "admin" or "user"' });
 
-        const userToUpdate = await usersCollection.findOne({ email: emailToUpdate });
+        const userToUpdate = await usersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${emailToUpdate}$`, 'i') } 
+        });
         if (!userToUpdate) return res.status(404).json({ error: 'User not found' });
 
         // Prevent updating your own role
-        if (req.user.email.toLowerCase() === emailToUpdate) {
+        if (req.user.email === emailToUpdate) {
           return res.status(403).json({ error: 'Cannot change your own role' });
         }
 
         const result = await usersCollection.updateOne(
-          { email: emailToUpdate },
+          { email: { $regex: new RegExp(`^${emailToUpdate}$`, 'i') } },
           { $set: { role, updatedAt: new Date() } }
         );
 
@@ -278,22 +302,25 @@ async function run() {
         if (!emailToUpdate) return res.status(400).json({ error: 'Email is required' });
         if (typeof isPremium !== 'boolean') return res.status(400).json({ error: 'isPremium must be a boolean' });
 
-        const userToUpdate = await usersCollection.findOne({ email: emailToUpdate });
+        const userToUpdate = await usersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${emailToUpdate}$`, 'i') } 
+        });
         if (!userToUpdate) return res.status(404).json({ error: 'User not found' });
 
-        // Prevent updating your own premium status
-        if (req.user.email.toLowerCase() === emailToUpdate) {
-          return res.status(403).json({ error: 'Cannot change your own premium status' });
-        }
-
         const result = await usersCollection.updateOne(
-          { email: emailToUpdate },
+          { email: { $regex: new RegExp(`^${emailToUpdate}$`, 'i') } },
           { $set: { isPremium, updatedAt: new Date() } }
         );
 
         if (result.matchedCount === 0) {
           return res.status(404).json({ error: 'User not found' });
         }
+
+        // Sync to members if biodata exists
+        await membersCollection.updateOne(
+          { email: { $regex: new RegExp(`^${emailToUpdate}$`, 'i') } },
+          { $set: { isPremium, updatedAt: new Date() } }
+        );
 
         res.status(200).json({ message: `User premium status updated to ${isPremium ? 'premium' : 'normal'} successfully`, isPremium });
       } catch (err) {
@@ -312,9 +339,18 @@ async function run() {
           return res.status(400).json({ error: 'Biodata ID is required' });
         }
 
-        // Check if user is premium
-        const userDoc = await usersCollection.findOne({ email });
-        if (!userDoc || !userDoc.isPremium) {
+        // Check if user is premium (prioritize members, fallback to users)
+        let userDoc = await membersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${email}$`, 'i') } 
+        });
+        let isPremium = userDoc?.isPremium || false;
+        if (!isPremium) {
+          userDoc = await usersCollection.findOne({ 
+            email: { $regex: new RegExp(`^${email}$`, 'i') } 
+          });
+          isPremium = userDoc?.isPremium || false;
+        }
+        if (!isPremium) {
           return res.status(403).json({ error: 'Only premium users can send contact requests. Please upgrade to premium.' });
         }
 
@@ -358,7 +394,9 @@ async function run() {
         const requestsWithDetails = await Promise.all(
           requests.map(async (req) => {
             const biodata = await membersCollection.findOne({ _id: new ObjectId(req.requestedBiodataId) });
-            const requester = await usersCollection.findOne({ email: req.requesterEmail });
+            const requester = await usersCollection.findOne({ 
+              email: { $regex: new RegExp(`^${req.requesterEmail}$`, 'i') } 
+            });
             return { ...req, biodata, requester };
           })
         );
@@ -455,21 +493,35 @@ async function run() {
           return res.status(400).json({ error: `Invalid _id format: ${id}` });
         }
 
-        let member = await membersCollection.findOne({ _id: new ObjectId(id) });
+        const members = await membersCollection.aggregate([
+          { $match: { _id: new ObjectId(id) } },
+          {
+            $lookup: {
+              from: 'users',
+              localField: 'email',
+              foreignField: 'email',
+              as: 'user'
+            }
+          },
+          { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
+          {
+            $addFields: {
+              isPremium: {
+                $ifNull: [
+                  '$isPremium',
+                  { $ifNull: ['$user.isPremium', false] }
+                ]
+              }
+            }
+          },
+          { $project: { user: 0 } }
+        ]).toArray();
 
-        if (!member) {
-          member = await membersCollection.findOne({ _id: id });
-        }
-
-        if (!member) {
-          const existingDoc = await membersCollection.findOne({ _id: new ObjectId(id) }, { projection: {} });
-          if (existingDoc) {
-            console.log('Incomplete document found for _id:', id, existingDoc);
-            return res.status(404).json({ error: `Incomplete biodata found with _id: ${id}`, document: existingDoc });
-          }
+        if (members.length === 0) {
           return res.status(404).json({ error: `No biodata found with _id: ${id}` });
         }
 
+        const member = members[0];
         res.json(member);
       } catch (error) {
         console.error(`Error fetching member with _id ${req.params.id}:`, error.message);
@@ -480,12 +532,13 @@ async function run() {
     // Get all biodatas or by email
     app.get('/biodatas', async (req, res) => {
       try {
-        const email = req.query.email;
+        const emailQuery = req.query.email;
+        const email = emailQuery ? emailQuery.toLowerCase() : null;
         let members;
         if (email) {
           // For own biodata, join isPremium
           members = await membersCollection.aggregate([
-            { $match: { email } },
+            { $match: { email: { $regex: new RegExp(`^${email}$`, 'i') } } },
             {
               $lookup: {
                 from: 'users',
@@ -497,7 +550,12 @@ async function run() {
             { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
             {
               $addFields: {
-                isPremium: { $ifNull: ['$user.isPremium', false] }
+                isPremium: {
+                  $ifNull: [
+                    '$isPremium',
+                    { $ifNull: ['$user.isPremium', false] }
+                  ]
+                }
               }
             },
             { $project: { user: 0 } }
@@ -516,7 +574,12 @@ async function run() {
             { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
             {
               $addFields: {
-                isPremium: { $ifNull: ['$user.isPremium', false] }
+                isPremium: {
+                  $ifNull: [
+                    '$isPremium',
+                    { $ifNull: ['$user.isPremium', false] }
+                  ]
+                }
               }
             },
             { $project: { user: 0 } }
@@ -539,7 +602,9 @@ async function run() {
           return res.status(400).json({ error: 'Email is required' });
         }
 
-        const existingBiodata = await membersCollection.findOne({ email });
+        const existingBiodata = await membersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${email.toLowerCase()}$`, 'i') } 
+        });
         if (existingBiodata) {
           return res.status(400).json({ error: 'Biodata already exists for this user' });
         }
@@ -549,6 +614,12 @@ async function run() {
         }
 
         const profileImageURL = await uploadImageToImgBB(req.file.buffer);
+
+        // Fetch isPremium from users or default to false
+        const userDoc = await usersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${email}$`, 'i') } 
+        });
+        const isPremium = userDoc?.isPremium || false;
 
         const newBiodata = {
           biodataType: biodata.biodataType || '',
@@ -566,11 +637,12 @@ async function run() {
           partnerAge: biodata.expectedPartnerAge || '',
           partnerHeight: biodata.expectedPartnerHeight || '',
           partnerWeight: biodata.expectedPartnerWeight || '',
-          contactEmail: biodata.contactEmail || email,
+          contactEmail: biodata.contactEmail || email.toLowerCase(),
           mobileNumber: biodata.mobileNumber || '',
           maritalStatus: biodata.maritalStatus || '',
           profileImage: profileImageURL,
-          email,
+          isPremium,
+          email: email.toLowerCase(),
           createdAt: new Date(),
           updatedAt: new Date(),
         };
@@ -609,7 +681,12 @@ async function run() {
           return res.status(404).json({ error: `No biodata found with _id: ${id}` });
         }
 
-        if (existingBiodata.email !== email) {
+        const currentUserDoc = await usersCollection.findOne({ 
+          email: { $regex: new RegExp(`^${req.user.email}$`, 'i') } 
+        });
+        const isCurrentAdmin = currentUserDoc?.role === 'admin';
+
+        if (!isCurrentAdmin && existingBiodata.email.toLowerCase() !== req.user.email.toLowerCase()) {
           return res.status(403).json({ error: 'Unauthorized: You can only update your own biodata' });
         }
 
@@ -620,6 +697,17 @@ async function run() {
           } catch (imgError) {
             console.warn('Image upload failed, proceeding with existing image:', imgError.message);
           }
+        }
+
+        // Preserve or fetch isPremium from users if not provided
+        let isPremium = existingBiodata.isPremium;
+        if (biodata.isPremium !== undefined) {
+          isPremium = biodata.isPremium;
+        } else {
+          const userDoc = await usersCollection.findOne({ 
+            email: { $regex: new RegExp(`^${email}$`, 'i') } 
+          });
+          isPremium = userDoc?.isPremium || false;
         }
 
         const updatedBiodata = {
@@ -638,11 +726,12 @@ async function run() {
           partnerAge: biodata.expectedPartnerAge || existingBiodata.partnerAge || '',
           partnerHeight: biodata.expectedPartnerHeight || existingBiodata.partnerHeight || '',
           partnerWeight: biodata.expectedPartnerWeight || existingBiodata.partnerWeight || '',
-          contactEmail: biodata.contactEmail || existingBiodata.contactEmail || email,
+          contactEmail: biodata.contactEmail || existingBiodata.contactEmail || email.toLowerCase(),
           mobileNumber: biodata.mobileNumber || existingBiodata.mobileNumber || '',
           maritalStatus: biodata.maritalStatus || existingBiodata.maritalStatus || '',
           profileImage: profileImageURL,
-          email: existingBiodata.email,
+          isPremium,
+          email: existingBiodata.email.toLowerCase(),
           updatedAt: new Date(),
           createdAt: existingBiodata.createdAt || new Date(),
         };
@@ -652,6 +741,13 @@ async function run() {
         if (result.matchedCount === 0) {
           return res.status(404).json({ error: `No biodata found with _id: ${id}` });
         }
+
+        // Sync back to users
+        await usersCollection.updateOne(
+          { email: { $regex: new RegExp(`^${email}$`, 'i') } },
+          { $set: { isPremium, updatedAt: new Date() } },
+          { upsert: true }
+        );
 
         res.json({
           message: 'Biodata updated successfully',
@@ -721,12 +817,16 @@ async function run() {
     // Get user favourites
     app.get('/favourites', async (req, res) => {
       try {
-        const { email } = req.query;
+        const emailQuery = req.query.email;
+        const email = emailQuery ? emailQuery.toLowerCase() : null;
+        if (!email) {
+          return res.status(400).json({ error: 'Email is required' });
+        }
 
-        const biodatas = await favouritesCollection.aggregate([
+        const favourites = await favouritesCollection.aggregate([
           {
             '$match': {
-              'userEmail': email
+              'userEmail': { $regex: new RegExp(`^${email}$`, 'i') }
             }
           }, {
             '$lookup': {
@@ -738,7 +838,7 @@ async function run() {
           }
         ]).toArray();
 
-        res.json(biodatas);
+        res.json(favourites);
       } catch (error) {
         console.error('Error fetching favourites:', error.message);
         res.status(500).json({ error: 'Failed to fetch favourites', details: error.message });
@@ -751,7 +851,7 @@ async function run() {
 
       const result = await favouritesCollection.deleteOne({
         _id: new ObjectId(id),
-        userEmail: email,
+        userEmail: { $regex: new RegExp(`^${email}$`, 'i') },
       });
 
       if (result.deletedCount === 0) {
