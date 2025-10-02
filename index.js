@@ -9,14 +9,17 @@ const FormData = require('form-data');
 const admin = require('firebase-admin');
 const sharp = require('sharp');
 
+
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Load environment variables
 dotenv.config();
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+console.log('STRIPE_SECRET_KEY:', process.env.STRIPE_SECRET_KEY);
 
 // Validate environment variables
-const requiredEnvVars = ['FIREBASE_PROJECT_ID', 'FIREBASE_PRIVATE_KEY', 'FIREBASE_CLIENT_EMAIL', 'DB_USER', 'DB_PASS', 'IMGBB_KEY'];
+const requiredEnvVars = ['FIREBASE_PROJECT_ID', 'FIREBASE_PRIVATE_KEY', 'FIREBASE_CLIENT_EMAIL', 'DB_USER', 'DB_PASS', 'IMGBB_KEY', 'STRIPE_SECRET_KEY'];
 const missingEnvVars = requiredEnvVars.filter((varName) => !process.env[varName]);
 if (missingEnvVars.length > 0) {
   console.error(`Missing required environment variables: ${missingEnvVars.join(', ')}`);
@@ -64,10 +67,29 @@ const authenticate = async (req, res, next) => {
   }
 };
 
+// MongoDB Connection
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.dit9xra.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
+
+let db;
+let usersCollection;
+let membersCollection;
+let paymentsCollection;
+let premiumRequestsCollection;
+let success_counters;
+let favouritesCollection;
+let contactRequestsCollection;
+
 // Admin authorization middleware
 const authorizeAdmin = async (req, res, next) => {
   try {
-    const user = await client.db('matrimonial').collection('users').findOne({ 
+    const user = await usersCollection.findOne({ 
       email: { $regex: new RegExp(`^${req.user.email}$`, 'i') } 
     });
     if (!user || user.role !== 'admin') {
@@ -80,25 +102,17 @@ const authorizeAdmin = async (req, res, next) => {
   }
 };
 
-// MongoDB Connection
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.dit9xra.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
-
 async function run() {
   try {
     await client.connect();
-    const db = client.db('matrimonial');
-    const usersCollection = db.collection('users');
-    const membersCollection = db.collection('members');
-    const success_counters = db.collection('success_counter');
-    const favouritesCollection = db.collection('favourites');
-    const contactRequestsCollection = db.collection('contactRequests');
+    db = client.db('matrimonial');
+    usersCollection = db.collection('users');
+    membersCollection = db.collection('members');
+    paymentsCollection = db.collection('payments');
+    premiumRequestsCollection = db.collection('premiumRequests');
+    success_counters = db.collection('success_counter');
+    favouritesCollection = db.collection('favourites');
+    contactRequestsCollection = db.collection('contactRequests');
 
     // Configure axios-retry for ImgBB requests
     axiosRetry(axios, {
@@ -115,7 +129,6 @@ async function run() {
         throw new Error("No image data provided");
       }
 
-      // Validate image format
       let imageInfo;
       try {
         imageInfo = await sharp(imageBuffer).metadata();
@@ -127,7 +140,6 @@ async function run() {
         throw new Error("Invalid image format");
       }
 
-      // Compress image
       let compressedBuffer;
       try {
         compressedBuffer = await sharp(imageBuffer)
@@ -140,7 +152,6 @@ async function run() {
         throw new Error("Failed to compress image");
       }
 
-      // Prepare FormData
       const formData = new FormData();
       formData.append('key', process.env.IMGBB_KEY);
       formData.append('image', compressedBuffer, {
@@ -171,7 +182,220 @@ async function run() {
       }
     }
 
-    // Create user (only if not exists)
+    // Create payment intent for premium payment
+    app.post('/create-payment-intent', authenticate, async (req, res) => {
+      try {
+        const { name, phone } = req.body;
+        const userEmail = req.user.email;
+        const userId = req.user.uid.toString();
+
+        if (!name || !phone) {
+          return res.status(400).json({ error: 'Name and phone number are required' });
+        }
+
+        // Create Stripe customer
+        const customer = await stripe.customers.create({
+          email: userEmail,
+          name,
+          phone,
+        });
+
+        // Create payment intent
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: 1000, // $10.00 in cents
+          currency: 'usd',
+          payment_method_types: ['card'],
+          customer: customer.id,
+          metadata: {
+            userId,
+            email: userEmail,
+          },
+        });
+
+        res.json({ client_secret: paymentIntent.client_secret });
+      } catch (error) {
+        console.error('Error creating payment intent:', error.message);
+        res.status(500).json({ error: 'Failed to create payment intent', details: error.message });
+      }
+    });
+
+    // Handle payment success
+    app.post('/handle-payment-success', authenticate, async (req, res) => {
+      try {
+        const { payment_intent } = req.body;
+        const userId = req.user.uid.toString();
+        const userEmail = req.user.email;
+
+        if (!payment_intent) {
+          return res.status(400).json({ error: 'Payment intent ID is required' });
+        }
+
+        // Retrieve payment intent
+        const paymentIntent = await stripe.paymentIntents.retrieve(payment_intent);
+        if (paymentIntent.status !== 'succeeded') {
+          return res.status(400).json({ error: 'Payment not successful' });
+        }
+
+        // Verify user
+        if (paymentIntent.metadata.userId !== userId) {
+          return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        // Store payment details
+        const paymentDoc = {
+          paymentIntentId: paymentIntent.id,
+          customerId: paymentIntent.customer,
+          userId,
+          email: userEmail,
+          name: paymentIntent.shipping?.name || paymentIntent.metadata.name || 'Unknown',
+          phone: paymentIntent.shipping?.phone || paymentIntent.metadata.phone || 'Unknown',
+          amount: paymentIntent.amount,
+          currency: paymentIntent.currency,
+          status: 'paid',
+          cardLast4: paymentIntent.payment_method ? (await stripe.paymentMethods.retrieve(paymentIntent.payment_method)).card?.last4 : 'N/A',
+          createdAt: new Date(),
+        };
+        await paymentsCollection.insertOne(paymentDoc);
+
+        // Create premium request
+        const existingRequest = await premiumRequestsCollection.findOne({
+          userId,
+          status: { $in: ['pending', 'approved'] },
+        });
+        if (existingRequest) {
+          return res.status(400).json({ error: 'Premium request already exists' });
+        }
+
+        const premiumRequest = {
+          userId,
+          email: userEmail,
+          paymentIntentId: paymentIntent.id,
+          amount: paymentIntent.amount,
+          status: 'pending',
+          createdAt: new Date(),
+        };
+        await premiumRequestsCollection.insertOne(premiumRequest);
+
+        res.json({ success: true, message: 'Payment successful, premium request sent for admin approval' });
+      } catch (error) {
+        console.error('Error handling payment success:', error.message);
+        res.status(500).json({ error: 'Failed to handle payment', details: error.message });
+      }
+    });
+
+    // Get all premium requests (admin only)
+    app.get('/premium-requests', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const { status } = req.query;
+        const filter = status ? { status } : {};
+        const requests = await premiumRequestsCollection.find(filter).toArray();
+
+        const requestsWithDetails = await Promise.all(
+          requests.map(async (req) => {
+            const user = await usersCollection.findOne({ 
+              $or: [{ uid: req.userId }, { email: { $regex: new RegExp(`^${req.email}$`, 'i') } }] 
+            });
+            const payment = await paymentsCollection.findOne({ paymentIntentId: req.paymentIntentId });
+            return { ...req, user, payment: payment || { cardLast4: 'N/A' } };
+          })
+        );
+
+        res.json(requestsWithDetails);
+      } catch (error) {
+        console.error('Error fetching premium requests:', error.message);
+        res.status(500).json({ error: 'Failed to fetch premium requests', details: error.message });
+      }
+    });
+
+    // Approve premium request by email (admin only)
+    app.patch('/premium-requests/email/:email/approve', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const email = req.params.email.toLowerCase();
+        const request = await premiumRequestsCollection.findOne({ 
+          email: { $regex: new RegExp(`^${email}$`, 'i') }, 
+          status: 'pending' 
+        });
+        if (!request) {
+          return res.status(404).json({ error: 'Pending premium request not found for this email' });
+        }
+
+        const result = await premiumRequestsCollection.updateOne(
+          { _id: new ObjectId(request._id) },
+          { $set: { status: 'approved', approvedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Premium request not found' });
+        }
+
+        await usersCollection.updateOne(
+          { $or: [{ uid: request.userId }, { email: { $regex: new RegExp(`^${email}$`, 'i') } }] },
+          { $set: { isPremium: true, updatedAt: new Date() } }
+        );
+
+        await membersCollection.updateOne(
+          { email: { $regex: new RegExp(`^${email}$`, 'i') } },
+          { $set: { isPremium: true, updatedAt: new Date() } }
+        );
+
+        res.json({ message: 'Premium request approved successfully' });
+      } catch (error) {
+        console.error('Error approving premium request:', error.message);
+        res.status(500).json({ error: 'Failed to approve premium request', details: error.message });
+      }
+    });
+
+    // Reject premium request by email (admin only)
+    app.patch('/premium-requests/email/:email/reject', authenticate, authorizeAdmin, async (req, res) => {
+      try {
+        const email = req.params.email.toLowerCase();
+        const request = await premiumRequestsCollection.findOne({ 
+          email: { $regex: new RegExp(`^${email}$`, 'i') }, 
+          status: 'pending' 
+        });
+        if (!request) {
+          return res.status(404).json({ error: 'Pending premium request not found for this email' });
+        }
+
+        const result = await premiumRequestsCollection.updateOne(
+          { _id: new ObjectId(request._id) },
+          { $set: { status: 'rejected', rejectedAt: new Date() } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: 'Premium request not found' });
+        }
+
+        res.json({ message: 'Premium request rejected successfully' });
+      } catch (error) {
+        console.error('Error rejecting premium request:', error.message);
+        res.status(500).json({ error: 'Failed to reject premium request', details: error.message });
+      }
+    });
+
+    // Get my premium requests
+    app.get('/my-premium-requests', authenticate, async (req, res) => {
+      try {
+        const { email, uid } = req.user;
+        const requests = await premiumRequestsCollection.find({ 
+          $or: [{ email }, { userId: uid }] 
+        }).sort({ createdAt: -1 }).toArray();
+
+        const requestsWithDetails = await Promise.all(
+          requests.map(async (req) => {
+            const payment = await paymentsCollection.findOne({ paymentIntentId: req.paymentIntentId });
+            return { ...req, payment: payment || { cardLast4: 'N/A' } };
+          })
+        );
+
+        res.json(requestsWithDetails);
+      } catch (error) {
+        console.error('Error fetching my premium requests:', error.message);
+        res.status(500).json({ error: 'Failed to fetch premium requests', details: error.message });
+      }
+    });
+
+    // Other endpoints (unchanged)
     app.post('/users', authenticate, async (req, res) => {
       try {
         const { name, photoURL, role, isPremium = false, targetEmail } = req.body;
@@ -179,14 +403,12 @@ async function run() {
         let uid = req.user.uid;
 
         if (targetEmail && targetEmail.toLowerCase() !== req.user.email.toLowerCase()) {
-          // Admin creating user for another email
           const currentUser = await usersCollection.findOne({ 
             email: { $regex: new RegExp(`^${req.user.email}$`, 'i') } 
           });
           if (!currentUser || currentUser.role !== 'admin') {
             return res.status(403).json({ error: 'Admin required to create user for another email' });
           }
-          // For other users, uid is null until they authenticate
           uid = null;
         }
 
@@ -217,7 +439,6 @@ async function run() {
       }
     });
 
-    // Get all users (admin only)
     app.get('/users', authenticate, authorizeAdmin, async (req, res) => {
       try {
         const users = await usersCollection.find().toArray();
@@ -228,21 +449,18 @@ async function run() {
       }
     });
 
-    // Get user by email (authenticated users can get their own or all if admin)
     app.get('/users/:email', authenticate, async (req, res) => {
       try {
         const emailParam = req.params.email.toLowerCase();
         if (!emailParam) {
           return res.status(400).json({ error: 'Email is required' });
         }
-        // Allow fetching own user or all if admin
         const userDoc = await usersCollection.findOne({ 
           email: { $regex: new RegExp(`^${emailParam}$`, 'i') } 
         });
         if (!userDoc) {
           return res.status(404).json({ error: 'User not found' });
         }
-        // If not admin and not own email, forbid
         if (req.user.email !== emailParam) {
           const currentUser = await usersCollection.findOne({ 
             email: { $regex: new RegExp(`^${req.user.email}$`, 'i') } 
@@ -258,7 +476,30 @@ async function run() {
       }
     });
 
-    // Update user role (admin only)
+    // New endpoint to get user by UID
+    app.get('/users/uid/:uid', authenticate, async (req, res) => {
+      try {
+        const uid = req.params.uid;
+        if (!uid) {
+          return res.status(400).json({ error: 'UID is required' });
+        }
+        const userDoc = await usersCollection.findOne({ uid });
+        if (!userDoc) {
+          return res.status(404).json({ error: 'User not found' });
+        }
+        if (req.user.uid !== uid) {
+          const currentUser = await usersCollection.findOne({ uid: req.user.uid });
+          if (!currentUser || currentUser.role !== 'admin') {
+            return res.status(403).json({ error: 'Forbidden: Can only fetch own user data' });
+          }
+        }
+        res.json(userDoc);
+      } catch (error) {
+        console.error('Error fetching user by uid:', error.message);
+        res.status(500).json({ error: 'Failed to fetch user', details: error.message });
+      }
+    });
+
     app.patch('/users/:email/role', authenticate, authorizeAdmin, async (req, res) => {
       try {
         const emailToUpdate = req.params.email.toLowerCase();
@@ -272,7 +513,6 @@ async function run() {
         });
         if (!userToUpdate) return res.status(404).json({ error: 'User not found' });
 
-        // Prevent updating your own role
         if (req.user.email === emailToUpdate) {
           return res.status(403).json({ error: 'Cannot change your own role' });
         }
@@ -293,7 +533,6 @@ async function run() {
       }
     });
 
-    // Update user premium status (admin only)
     app.patch('/users/:email/premium', authenticate, authorizeAdmin, async (req, res) => {
       try {
         const emailToUpdate = req.params.email.toLowerCase();
@@ -316,7 +555,6 @@ async function run() {
           return res.status(404).json({ error: 'User not found' });
         }
 
-        // Sync to members if biodata exists
         await membersCollection.updateOne(
           { email: { $regex: new RegExp(`^${emailToUpdate}$`, 'i') } },
           { $set: { isPremium, updatedAt: new Date() } }
@@ -329,7 +567,6 @@ async function run() {
       }
     });
 
-    // Create contact request
     app.post('/contact-requests', authenticate, async (req, res) => {
       try {
         const { biodataId } = req.body;
@@ -339,7 +576,6 @@ async function run() {
           return res.status(400).json({ error: 'Biodata ID is required' });
         }
 
-        // Check if user is premium (prioritize members, fallback to users)
         let userDoc = await membersCollection.findOne({ 
           email: { $regex: new RegExp(`^${email}$`, 'i') } 
         });
@@ -354,7 +590,6 @@ async function run() {
           return res.status(403).json({ error: 'Only premium users can send contact requests. Please upgrade to premium.' });
         }
 
-        // Check if request already exists
         const existingRequest = await contactRequestsCollection.findOne({
           requesterEmail: email,
           requestedBiodataId: biodataId,
@@ -382,15 +617,12 @@ async function run() {
       }
     });
 
-    // Get all contact requests (admin only)
     app.get('/contact-requests', authenticate, authorizeAdmin, async (req, res) => {
       try {
-        // Optionally filter by status, e.g., query param ?status=pending
         const { status } = req.query;
         const filter = status ? { status } : {};
         const requests = await contactRequestsCollection.find(filter).toArray();
 
-        // Join with biodata and requester details
         const requestsWithDetails = await Promise.all(
           requests.map(async (req) => {
             const biodata = await membersCollection.findOne({ _id: new ObjectId(req.requestedBiodataId) });
@@ -408,7 +640,6 @@ async function run() {
       }
     });
 
-    // Approve contact request (admin only)
     app.patch('/contact-requests/:id/approve', authenticate, authorizeAdmin, async (req, res) => {
       try {
         const requestId = req.params.id;
@@ -428,7 +659,6 @@ async function run() {
       }
     });
 
-    // Reject contact request (admin only)
     app.patch('/contact-requests/:id/reject', authenticate, authorizeAdmin, async (req, res) => {
       try {
         const requestId = req.params.id;
@@ -448,13 +678,11 @@ async function run() {
       }
     });
 
-    // Get my contact requests
     app.get('/my-contact-requests', authenticate, async (req, res) => {
       try {
         const { email } = req.user;
         const requests = await contactRequestsCollection.find({ requesterEmail: email }).sort({ createdAt: -1 }).toArray();
 
-        // For approved requests, join with biodata details
         const requestsWithDetails = await Promise.all(
           requests.map(async (req) => {
             if (req.status === 'approved') {
@@ -472,7 +700,6 @@ async function run() {
       }
     });
 
-    // Success counter
     app.get('/success-counter', async (req, res) => {
       try {
         const success = await success_counters.find().toArray();
@@ -483,7 +710,6 @@ async function run() {
       }
     });
 
-    // Get biodata by _id
     app.get('/biodatas/:id', async (req, res) => {
       try {
         const id = req.params.id;
@@ -493,35 +719,21 @@ async function run() {
           return res.status(400).json({ error: `Invalid _id format: ${id}` });
         }
 
-        const members = await membersCollection.aggregate([
-          { $match: { _id: new ObjectId(id) } },
-          {
-            $lookup: {
-              from: 'users',
-              localField: 'email',
-              foreignField: 'email',
-              as: 'user'
-            }
-          },
-          { $unwind: { path: '$user', preserveNullAndEmptyArrays: true } },
-          {
-            $addFields: {
-              isPremium: {
-                $ifNull: [
-                  '$isPremium',
-                  { $ifNull: ['$user.isPremium', false] }
-                ]
-              }
-            }
-          },
-          { $project: { user: 0 } }
-        ]).toArray();
+        let member = await membersCollection.findOne({ _id: new ObjectId(id) });
 
-        if (members.length === 0) {
+        if (!member) {
+          member = await membersCollection.findOne({ _id: id });
+        }
+
+        if (!member) {
+          const existingDoc = await membersCollection.findOne({ _id: new ObjectId(id) }, { projection: {} });
+          if (existingDoc) {
+            console.log('Incomplete document found for _id:', id, existingDoc);
+            return res.status(404).json({ error: `Incomplete biodata found with _id: ${id}`, document: existingDoc });
+          }
           return res.status(404).json({ error: `No biodata found with _id: ${id}` });
         }
 
-        const member = members[0];
         res.json(member);
       } catch (error) {
         console.error(`Error fetching member with _id ${req.params.id}:`, error.message);
@@ -529,14 +741,12 @@ async function run() {
       }
     });
 
-    // Get all biodatas or by email
     app.get('/biodatas', async (req, res) => {
       try {
         const emailQuery = req.query.email;
         const email = emailQuery ? emailQuery.toLowerCase() : null;
         let members;
         if (email) {
-          // For own biodata, join isPremium
           members = await membersCollection.aggregate([
             { $match: { email: { $regex: new RegExp(`^${email}$`, 'i') } } },
             {
@@ -561,7 +771,6 @@ async function run() {
             { $project: { user: 0 } }
           ]).toArray();
         } else {
-          // For all (public)
           members = await membersCollection.aggregate([
             {
               $lookup: {
@@ -592,7 +801,6 @@ async function run() {
       }
     });
 
-    // Create biodata
     app.post('/biodatas', authenticate, upload.single('profileImage'), async (req, res) => {
       try {
         const biodata = req.body;
@@ -615,7 +823,6 @@ async function run() {
 
         const profileImageURL = await uploadImageToImgBB(req.file.buffer);
 
-        // Fetch isPremium from users or default to false
         const userDoc = await usersCollection.findOne({ 
           email: { $regex: new RegExp(`^${email}$`, 'i') } 
         });
@@ -662,7 +869,6 @@ async function run() {
       }
     });
 
-    // Update biodata by _id
     app.patch('/biodatas/:id', authenticate, upload.single('profileImage'), async (req, res) => {
       try {
         const id = req.params.id;
@@ -699,7 +905,6 @@ async function run() {
           }
         }
 
-        // Preserve or fetch isPremium from users if not provided
         let isPremium = existingBiodata.isPremium;
         if (biodata.isPremium !== undefined) {
           isPremium = biodata.isPremium;
@@ -742,7 +947,6 @@ async function run() {
           return res.status(404).json({ error: `No biodata found with _id: ${id}` });
         }
 
-        // Sync back to users
         await usersCollection.updateOne(
           { email: { $regex: new RegExp(`^${email}$`, 'i') } },
           { $set: { isPremium, updatedAt: new Date() } },
@@ -763,7 +967,6 @@ async function run() {
       }
     });
 
-    // Delete biodata by _id (admin only)
     app.delete('/biodatas/:id', authenticate, authorizeAdmin, async (req, res) => {
       try {
         const id = req.params.id;
@@ -781,7 +984,6 @@ async function run() {
       }
     });
 
-    // Add to favourites
     app.post('/favourites', authenticate, async (req, res) => {
       try {
         const { biodata_id } = req.body;
@@ -814,7 +1016,6 @@ async function run() {
       }
     });
 
-    // Get user favourites
     app.get('/favourites', async (req, res) => {
       try {
         const emailQuery = req.query.email;
@@ -861,7 +1062,6 @@ async function run() {
       res.json({ message: "Favorite removed successfully" });
     });
 
-    // MongoDB ping
     await client.db('admin').command({ ping: 1 });
     console.log('MongoDB connected successfully');
   } catch (error) {
@@ -875,12 +1075,10 @@ run().catch((error) => {
   process.exit(1);
 });
 
-// Root route
 app.get('/', (req, res) => {
   res.send('Love Matrimony server is running...');
 });
 
-// Start server
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
